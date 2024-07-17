@@ -226,6 +226,8 @@ let run ?ui ?tracefile ~proc_mgr ~fs { freq; cpu; child_args } =
   let out = Eio.Path.open_out ~sw tracefile ~create:(`Or_truncate 0o644) in
   Eio.Buf_write.with_flow out @@ fun w ->
   let fxt = Write.of_writer w in
+  let perf_sched = Eio.Process.spawn ~sw proc_mgr ["sudo"; "perf"; "sched"; "record"; "-k"; "CLOCK_MONOTONIC"] in
+  Eio_unix.sleep 0.5;           (* Give perf time to start *)
   traceln "Recording to %a" Eio.Path.pp tracefile;
   let child = spawn_child ~sw ~proc_mgr ~tmp_dir child_args in
   cpu |> Option.iter (fun cpu -> Processor.Affinity.set_cpus [List.nth Processor.Topology.t cpu]);
@@ -249,6 +251,18 @@ let run ?ui ?tracefile ~proc_mgr ~fs { freq; cpu; child_args } =
        let r = Eio.Process.await child in
        traceln "Child finished: %a" Eio.Process.pp_status r;
        child_finished := true;
+       Eio.Process.signal perf_sched Sys.sigterm;
+       begin match Eio.Process.await perf_sched with
+         | `Signaled x when x = Sys.sigterm -> traceln "perf sched record finished... processing data"
+         | x -> traceln "Warning: unexpected exit %a from perf sched record" Eio.Process.pp_status x
+       end;
+       Eio.Process.run proc_mgr ["sudo"; "chown"; "user"; "perf.data"];
+       let adjust_ext path = Filename.remove_extension path ^ ".sched" in
+       let schedule = (fst tracefile, adjust_ext (snd tracefile)) in
+       Eio.Path.with_open_out ~create:(`Or_truncate 0o600) schedule (fun csv ->
+           Eio.Process.run proc_mgr ["perf"; "script"; "./perf-sched.py"] ~stdout:csv
+         );
+       traceln "Wrote %a" Eio.Path.pp schedule
     );
   match ui with
   | None -> Ok ()

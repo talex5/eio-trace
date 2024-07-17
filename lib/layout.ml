@@ -3,6 +3,7 @@ let debug_layout = false
 type timestamp = float    (* ns since start_time *)
 
 module Ids = Map.Make(Int)
+module Tids = Trace.Sched.Tids
 
 module Spans : sig
   type 'a t
@@ -70,6 +71,8 @@ module Ring = struct
 
   type t = {
     events : (timestamp * Trace.Ring.event list) array;
+    schedule : Trace.Sched.event array;
+    tid : int option;
     mutable y : int;
     mutable height : int;
     mutable roots : root list;
@@ -82,6 +85,7 @@ type t = {
   duration : float;
   height : int;
   rings : Ring.t Trace.Rings.t;
+  ring_of_tid : int Tids.t;
 }
 
 let get t id = Ids.find_opt id t.items
@@ -238,8 +242,9 @@ let of_trace (trace : Trace.t) =
   in
   let import_ring r =
     let events = List.map (fun (ts, s) -> time ts, s) r.Trace.Ring.events |> List.rev |> Array.of_list in
+    let schedule = r.Trace.Ring.schedule |> Array.of_list in
     let roots = List.map import_root (List.rev r.roots) in
-    { Ring.events; y = 0; height = 1; roots }
+    { Ring.events; schedule; tid = r.tid; y = 0; height = 1; roots }
   in
   let rings = Trace.Rings.map import_ring trace.rings in
   let items = !items in
@@ -251,7 +256,14 @@ let of_trace (trace : Trace.t) =
       y := !y + ring.height;
     );
   let height = !y in
-  { start_time; duration; height; items; rings }
+  let ring_of_tid =
+    let x = ref Tids.empty in
+    rings |> Trace.Rings.iter (fun id ring ->
+        ring.Ring.tid |> Option.iter (fun tid -> x := Tids.add tid id !x)
+      );
+    !x
+  in
+  { start_time; duration; height; items; rings; ring_of_tid }
 
 let start_time t = t.start_time
 
@@ -262,5 +274,6 @@ let load tracefile =
   let len = in_channel_length ch in
   let data = really_input_string ch len in
   close_in ch;
-  let trace = Trace.create data in
-  of_trace trace
+  let sched = Filename.remove_extension tracefile ^ ".sched" in
+  let trace = Trace.create ~sched data in
+  of_trace  trace

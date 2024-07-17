@@ -261,6 +261,85 @@ module Make (C : CANVAS) = struct
     if stop = Array.length arr then
       fn (stop, v.View.layout.duration, [])
 
+  let render_sched_events v cr (ring : Layout.Ring.t) =
+    ring.tid |> Option.iter @@ fun tid ->
+    let h = 4. in
+    let y = y_of_row v ring.y +. ((Style.line_spacing -. h) /. 2.) in
+    let x0 = ref None in
+    let end_text = ref 0. in
+    ring.schedule |> Array.iter (fun (ev : Trace.Sched.event) ->
+        let ts = Int64.sub ev.ts v.layout.start_time |> Int64.to_float in
+        begin match ev.op with
+          | Wake ->
+            let x = View.x_of_time v ts in
+            x0 := Some x
+          | Switch (prev_tid, prev, next) ->
+            let x = View.x_of_time v ts in
+            if ev.tid <> tid then (
+              (* Switching from us; draw a green line showing we've been running *)
+              !x0 |> Option.iter (fun x0 ->
+                  let w = x -. x0 in
+                  C.set_source_rgb cr ~r:0.4 ~g:0.8 ~b:0.4;
+                  C.rectangle cr ~x:x0 ~y ~w ~h;
+                  C.fill cr;
+                  if next <> "" && x > !end_text then (
+                    match Layout.Tids.find_opt ev.tid v.layout.ring_of_tid with
+                    | None ->
+                      (* Switching from to a different process; show its name *)
+                      C.set_source_rgb cr ~r:0. ~g:0. ~b:0.;
+                      let text_size = C.text_extents cr next in
+                      C.paint_text cr ~x ~y:(y +. 16.) next;
+                      end_text := x +. text_size.width;
+                    | Some id ->
+                      (* Switching from to a different domain; draw a line *)
+                      let ring2 = Layout.Tids.find id v.layout.rings in
+                      let y1 = y_of_row v ring.y in
+                      let y2 = y_of_row v ring2.y in
+                      let y1, y2 = if y1 < y2 then y1, y2 else y2, y1 in
+                      let y1 = y1 +. ((Style.line_spacing -. h) /. 2.) in
+                      let y2 = y2 +. ((Style.line_spacing +. h) /. 2.) in
+                      C.rectangle cr ~x ~y:y1 ~w:1. ~h:(y2 -. y1);
+                      C.fill cr;
+                  )
+                );
+              x0 := Some x;
+            ) else (
+              (* Switching to us; draw a line from when we were runnable. *)
+              !x0 |> Option.iter (fun x0 ->
+                  let w = x -. x0 in
+                  C.set_source_rgb cr ~r:0. ~g:0. ~b:0.;
+                  C.rectangle cr ~x:x0 ~y ~w ~h;
+                  C.fill cr
+                );
+              if prev <> "" && x > !end_text then (
+                if not (Layout.Tids.mem prev_tid v.layout.ring_of_tid) then (
+                  C.set_source_rgb cr ~r:0. ~g:0. ~b:0.;
+                  let text_size = C.text_extents cr prev in
+                  let x = x -. text_size.width -. 2. in
+                  if x > !end_text then (
+                    C.paint_text cr ~x ~y:(y +. 16.) prev;
+                    end_text := x +. text_size.width;
+                  )
+                )
+              );
+              x0 := Some x;
+            )
+          | Migrate cpu ->
+            let w = 6. in
+            let x = View.x_of_time v ts -. w /. 2. in
+            C.set_source_rgb cr ~r:0. ~g:0. ~b:0.;
+            C.rectangle cr ~x ~y:(y -. 2.) ~w ~h:(h +. 4.);
+            C.fill cr;
+            let x = x -. 10. in
+            if x > !end_text then (
+              let msg = Printf.sprintf "%d→%d" ev.cpu cpu in
+              C.paint_text cr ~x ~y:(y +. 16.) msg;
+              let text_size = C.text_extents cr msg in
+              end_text := x +. text_size.width;
+            )
+        end;
+      )
+
   let render_gc_events v cr (ring : Layout.Ring.t) layer =
     let y = y_of_row v ring.y in
     let h = float ring.height *. Style.line_spacing in
@@ -338,8 +417,10 @@ module Make (C : CANVAS) = struct
 
   let render_ring v cr (ring : Layout.Ring.t) =
     render_gc_events v cr ring `Fg;
-    ring.roots |> List.iter @@ fun (root : Layout.Ring.root) ->
-    root.cc |> Option.iter (fun (_ts, cc) -> render_events v cr cc)
+    ring.roots |> List.iter (fun (root : Layout.Ring.root) ->
+        root.cc |> Option.iter (fun (_ts, cc) -> render_events v cr cc)
+      );
+    render_sched_events v cr ring
 
   let render_grid v cr =
     C.set_line_width cr 1.0;

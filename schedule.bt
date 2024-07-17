@@ -1,0 +1,15 @@
+tracepoint:sched:sched_waking {
+  printf("%lu, wake, %d, %d\n", nsecs, args->pid, args->target_cpu);
+}
+
+tracepoint:sched:sched_switch {
+  printf("%lu, switch, %d, %d, %s\n", nsecs, args->next_pid, cpu, args->next_comm);
+}
+
+tracepoint:sched:sched_migrate_task {
+  printf("%lu, migrate, %d, %d, %d\n", nsecs, args->pid, args->orig_cpu, args->dest_cpu);
+}
+
+// tracepoint:sched:sched_process_fork {
+//   @[comm, tid] = ustack;
+// }

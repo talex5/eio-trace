@@ -7,6 +7,69 @@ let i64 = Int64.to_int
 
 type timestamp = int64
 
+module Sched = struct
+  type cpu = int
+
+  module Cpus = Map.Make(Int)
+  module Tids = Map.Make(Int)
+
+  type op =
+    | Wake
+    | Switch of int * string * string
+    | Migrate of cpu
+
+  type event = {
+    ts : timestamp;
+    tid : int;
+    cpu : cpu;
+    op : op;
+  }
+
+  type t = event list Tids.t
+
+  let load path =
+    let thread_on = ref Cpus.empty in
+    let threads = ref Tids.empty in
+    let ch = open_in path in
+    try
+      while true do
+        let line = input_line ch in
+        match String.split_on_char ',' line |> List.map String.trim with
+        | [ts; "wake"; tid; cpu] ->
+          let ev = {
+            ts = Int64.of_string ts;
+            tid = int_of_string tid;
+            cpu = int_of_string cpu;
+            op = Wake;
+          } in
+          threads := Tids.add_to_list ev.tid ev !threads
+        | [ts; "switch"; tid; cpu; prev_tid; prev; next] ->
+          let ev = {
+            ts = Int64.of_string ts;
+            tid = int_of_string tid;
+            cpu = int_of_string cpu;
+            op = Switch (int_of_string prev_tid, prev, next);
+          } in
+          Cpus.find_opt ev.cpu !thread_on |> Option.iter (fun old_tid ->
+              threads := Tids.add_to_list old_tid ev !threads
+            );
+          thread_on := Cpus.add ev.cpu ev.tid !thread_on;
+          threads := Tids.add_to_list ev.tid ev !threads
+        | [ts; "migrate"; tid; cpu; cpu2] ->
+          let ev = {
+            ts = Int64.of_string ts;
+            tid = int_of_string tid;
+            cpu = int_of_string cpu;
+            op = Migrate (int_of_string cpu2);
+          } in
+          threads := Tids.add_to_list ev.tid ev !threads
+        | bits -> Fmt.epr "Bad schedule line: %a@." (Fmt.Dump.list Fmt.string) bits
+      done
+    with End_of_file ->
+      close_in ch;
+      Cpus.map List.rev !threads
+end
+
 type activation = [
   | `Pause
   | `Fiber of int
@@ -46,15 +109,9 @@ module Ring = struct
     mutable current_fiber : int option;
     mutable events : (timestamp * event list) list;
     mutable roots : root list;
+    mutable tid : int option;
+    mutable schedule : Sched.event list;
   }
-
-  let push t ts e =
-    let stack =
-      match t.events with
-      | [] -> []
-      | (_, s) :: _ -> s
-    in
-    t.events <- (ts, e :: stack) :: t.events
 
   let pop t ts =
     let tail =
@@ -64,19 +121,28 @@ module Ring = struct
       | _ :: _ -> print_endline "warning: unmatched pop!"; []
     in
     t.events <- (ts, tail) :: t.events
+
+  let push t ts e =
+    let stack =
+      match t.events with
+      | [] -> []
+      | (_, s) :: _ -> s
+    in
+    t.events <- (ts, e :: stack) :: t.events
 end
 
 type t = {
   mutable start_time : timestamp;
   mutable rings : Ring.t Rings.t;
   mutable items : item Ids.t;
+  sched : Sched.t;
 }
 
 let get_ring t ring =
   match Rings.find_opt ring t.rings with
   | Some x -> x
   | None ->
-    let x = { Ring.current_fiber = None; events = []; roots = [] } in
+    let x = { Ring.current_fiber = None; events = []; roots = []; tid = None; schedule = [] } in
     t.rings <- Rings.add ring x t.rings;
     x
 
@@ -112,7 +178,13 @@ let ring_of_thread t (thread : Read.thread) =
   let id = i64 thread.tid in
   if id land 3 = 1 then (
     let ring = id lsr 2 in
-    Some (get_ring t ring)
+    let x = get_ring t ring in
+    if ring = 0 && x.tid = None then (
+      let tid = Int64.to_int thread.pid in
+      x.tid <- Some tid;
+      x.schedule <- Sched.Tids.find_opt tid t.sched |> Option.value ~default:[]
+    );
+    Some x
   ) else None
 
 let fiber_of_thread t (thread : Read.thread) =
@@ -141,17 +213,17 @@ let process_event t e =
     let ring = get_ring t ring_id in
     let cc = get t id in
     begin match fiber_of_thread t thread with
-    | Some parent_fiber ->
+      | Some parent_fiber ->
         let parent_item = get t (parent_fiber.inner_cc) in
         parent_item.events <- (timestamp, Create_cc (ty, cc)) :: parent_item.events;
         cc.parent <- Some parent_item;
         parent_fiber.inner_cc <- id
-    | None ->
+      | None ->
         begin match ring.roots with
-        | root :: _ when root.cc = None -> root.cc <- Some (timestamp, cc)
-        | _ ->
-          let root = { Ring.parent = None; cc = Some (timestamp, cc) } in
-          ring.roots <- root :: ring.roots
+          | root :: _ when root.cc = None -> root.cc <- Some (timestamp, cc)
+          | _ ->
+            let root = { Ring.parent = None; cc = Some (timestamp, cc) } in
+            ring.roots <- root :: ring.roots
         end
     end
   | "eio", "cc", Duration_end ->
@@ -225,6 +297,12 @@ let process_event t e =
         let root = { Ring.parent = Some (timestamp, parent); cc = None } in
         ring.roots <- root :: ring.roots
       )
+  | "ocaml", "domain-spawn", Instant ->
+    ring_of_thread t thread |> Option.iter (fun (ring : Ring.t) ->
+        let tid = List.assoc_opt "tid" args |> Option.get |> as_int64 |> Int64.to_int in
+        ring.tid <- Some tid;
+        ring.schedule <- Sched.Tids.find_opt tid t.sched |> Option.value ~default:[]
+      )
   | _ -> ()
 
 let process t reader =
@@ -243,11 +321,12 @@ let process t reader =
   | Kernel _ -> ()
   | Unknown _ -> ()
 
-let create data =
+let create ~sched data =
   let t = {
     start_time = Int64.max_int;
     rings = Rings.empty;
     items = Ids.empty;
+    sched = Sched.load sched;
   } in
   Eio.Buf_read.parse_string_exn (process t) data;
   t
